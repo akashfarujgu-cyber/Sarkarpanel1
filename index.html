@@ -1,0 +1,373 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  onSnapshot, 
+  updateDoc, 
+  addDoc,
+  query
+} from 'firebase/firestore';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  Menu, X, Zap, Wallet, 
+  Clock, Copy, List, LogOut, Lock, Edit3, Sparkles, BrainCircuit, AlertCircle, Settings
+} from 'lucide-react';
+
+// --- INITIAL CONFIG ---
+const INITIAL_CONFIG = {
+  panelName: "ASSARKARPANEL.COM",
+  upiId: "akash3729@fam",
+  adminPin: "3729", 
+  igFollowersRate: 115,
+  igLikesRate: 45
+};
+
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false); // Track if auth is finished
+  const [activeTab, setActiveTab] = useState('new_order');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isOwner, setIsOwner] = useState(false); 
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [enteredPin, setEnteredPin] = useState("");
+  
+  const [config, setConfig] = useState(INITIAL_CONFIG);
+  const [balance, setBalance] = useState(0.00);
+  const [orders, setOrders] = useState([]);
+  const [paymentRequests, setPaymentRequests] = useState([]);
+  const [message, setMessage] = useState({ text: '', type: '' });
+
+  const [quantity, setQuantity] = useState('');
+  const [link, setLink] = useState('');
+  const [selectedService, setSelectedService] = useState('followers');
+
+  // STEP 1: Handle Authentication FIRST (Rule 3)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { 
+        console.error("Auth Error:", err); 
+      }
+    };
+    initAuth();
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthReady(!!u);
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // STEP 2: Sync Global Config (Only after user is authenticated)
+  useEffect(() => {
+    if (!authReady || !user) return;
+
+    const configRef = doc(db, 'artifacts', appId, 'public', 'settings');
+    const unsubConfig = onSnapshot(configRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setConfig(docSnap.data());
+      } else {
+        setDoc(configRef, INITIAL_CONFIG).catch(e => console.error("Initial Config Error:", e));
+      }
+    }, (error) => console.error("Config Listener Error:", error));
+
+    return () => unsubConfig();
+  }, [authReady, user]);
+
+  // STEP 3: Sync User Data & Payments (Only after user is authenticated)
+  useEffect(() => {
+    if (!authReady || !user) return;
+    
+    // User Profile
+    const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data');
+    const unsubProfile = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setBalance(docSnap.data().balance || 0);
+      } else {
+        setDoc(userDocRef, { balance: 0, createdAt: Date.now() }).catch(e => console.error("Profile Create Error:", e));
+      }
+    }, (error) => console.error("Profile Listener Error:", error));
+
+    // Public Payments
+    const payRef = collection(db, 'artifacts', appId, 'public', 'data', 'payments');
+    const unsubPay = onSnapshot(payRef, (snapshot) => {
+      setPaymentRequests(snapshot.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b) => b.timestamp - a.timestamp));
+    }, (error) => console.error("Payments Listener Error:", error));
+
+    // User Orders
+    const orderRef = collection(db, 'artifacts', appId, 'users', user.uid, 'orders');
+    const unsubOrders = onSnapshot(orderRef, (snapshot) => {
+      setOrders(snapshot.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b) => b.timestamp - a.timestamp));
+    }, (error) => console.error("Orders Listener Error:", error));
+
+    return () => { 
+      unsubProfile(); 
+      unsubPay(); 
+      unsubOrders(); 
+    };
+  }, [authReady, user]);
+
+  const showStatus = (text, type) => {
+    setMessage({ text, type });
+    setTimeout(() => setMessage({ text: '', type: '' }), 4000);
+  };
+
+  const updateGlobalSetting = async (key, currentValue) => {
+    if (!isOwner || !user) return;
+    const newVal = prompt(`Naya value daalein (${key}):`, currentValue);
+    if (newVal === null || newVal.trim() === "") return;
+
+    try {
+      const configRef = doc(db, 'artifacts', appId, 'public', 'settings');
+      const finalValue = isNaN(newVal) ? newVal : Number(newVal);
+      await updateDoc(configRef, { [key]: finalValue });
+      showStatus(`${key} update ho gaya! ✨`, "success");
+    } catch (err) {
+      showStatus("Error: Permission denied or Update failed", "error");
+    }
+  };
+
+  const verifyAdmin = () => {
+    if (enteredPin === config.adminPin) {
+      setIsOwner(true);
+      setActiveTab('admin_panel');
+      setShowLoginModal(false);
+      setEnteredPin("");
+      showStatus("Admin Editing Mode ON ✨", "success");
+    } else {
+      showStatus("Galat PIN! Try again.", "error");
+      setEnteredPin("");
+    }
+  };
+
+  const handlePlaceOrder = async (e) => {
+    e.preventDefault();
+    if (!user) return;
+    const currentRate = selectedService === 'followers' ? config.igFollowersRate : config.igLikesRate;
+    const charge = (parseInt(quantity) / 1000) * currentRate;
+    if (balance < charge) return showStatus('Account mein paise kam hain!', 'error');
+
+    try {
+      const orderRef = collection(db, 'artifacts', appId, 'users', user.uid, 'orders');
+      await addDoc(orderRef, {
+        service: selectedService === 'followers' ? "Instagram Followers" : "Instagram Likes",
+        link,
+        quantity: parseInt(quantity),
+        charge: charge.toFixed(2),
+        status: 'Processing',
+        timestamp: Date.now()
+      });
+      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'data'), { balance: balance - charge });
+      showStatus('Order success! ✨', 'success');
+      setLink(''); setQuantity('');
+    } catch (err) { showStatus('Order failed!', 'error'); }
+  };
+
+  const handlePaymentSubmit = async (e) => {
+    e.preventDefault();
+    if (!user) return;
+    const amount = parseFloat(e.target.amount.value);
+    const utr = e.target.utr.value;
+    if (utr.length < 10) return showStatus('UTR sahi se daalein!', 'error');
+
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'payments'), {
+        userId: user.uid,
+        amount,
+        utr,
+        status: 'Pending',
+        timestamp: Date.now(),
+        timeStr: new Date().toLocaleString()
+      });
+      e.target.reset();
+      showStatus('Payment request bhej di gayi hai.', 'success');
+    } catch (err) { showStatus('Submit Error', 'error'); }
+  };
+
+  const approvePayment = async (req) => {
+    if (!isOwner || !user) return;
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'payments', req.id), { status: 'Approved' });
+      const targetUserRef = doc(db, 'artifacts', appId, 'users', req.userId, 'profile', 'data');
+      const snap = await getDoc(targetUserRef);
+      const currentBal = snap.exists() ? snap.data().balance : 0;
+      await updateDoc(targetUserRef, { balance: currentBal + req.amount });
+      showStatus(`₹${req.amount} approved! ✨`, 'success');
+    } catch (err) { showStatus('Approval Error', 'error'); }
+  };
+
+  if (!authReady) {
+    return (
+      <div className="h-screen w-screen flex items-center justify-center bg-slate-50">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-pink-500 border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Connecting to Server...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen bg-[#f8fafc] text-slate-800 font-sans overflow-hidden text-sm">
+      
+      {/* PIN MODAL */}
+      {showLoginModal && (
+        <div className="fixed inset-0 z-[100] bg-slate-900/70 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-[320px] rounded-[32px] p-8 shadow-2xl animate-in zoom-in-95 duration-300">
+             <div className="text-center mb-8">
+                <div className="bg-pink-100 w-16 h-16 rounded-3xl flex items-center justify-center mx-auto mb-4 text-pink-600 shadow-inner">
+                  <Lock size={28} />
+                </div>
+                <h3 className="text-xl font-black text-slate-900">Admin Login</h3>
+                <p className="text-[10px] font-bold text-slate-400 uppercase mt-1 tracking-widest">Enter Secure PIN</p>
+             </div>
+             
+             <div className="flex justify-center gap-3 mb-8">
+               {[...Array(4)].map((_, i) => (
+                 <div key={i} className={`w-12 h-14 rounded-2xl border-2 flex items-center justify-center text-2xl font-black transition-all duration-200 ${enteredPin[i] ? 'border-pink-500 bg-pink-50 text-pink-600 scale-105 shadow-md' : 'border-slate-100 bg-slate-50 text-slate-200'}`}>
+                   {enteredPin[i] ? '●' : '○'}
+                 </div>
+               ))}
+             </div>
+
+             <div className="grid grid-cols-3 gap-3 mb-6">
+               {[1,2,3,4,5,6,7,8,9].map(n => (
+                 <button key={n} onClick={() => enteredPin.length < 4 && setEnteredPin(p => p + n)} className="h-14 rounded-2xl bg-slate-50 font-black text-lg hover:bg-slate-100 active:scale-90 transition-all shadow-sm border border-slate-100/50">{n}</button>
+               ))}
+               <button onClick={() => setEnteredPin("")} className="h-14 rounded-2xl bg-slate-50 text-[10px] text-slate-400 font-black uppercase tracking-tighter">Clear</button>
+               <button onClick={() => enteredPin.length < 4 && setEnteredPin(p => p + "0")} className="h-14 rounded-2xl bg-slate-50 font-black text-lg">0</button>
+               <button onClick={verifyAdmin} className="h-14 rounded-2xl bg-pink-600 text-white font-black text-xs shadow-lg shadow-pink-200 hover:bg-pink-700 active:scale-95 transition-all">GO</button>
+             </div>
+             <button onClick={() => {setShowLoginModal(false); setEnteredPin("");}} className="w-full text-slate-400 font-bold text-[10px] uppercase tracking-widest hover:text-slate-600 transition">Back to Panel</button>
+          </div>
+        </div>
+      )}
+
+      {/* SIDEBAR */}
+      <aside className={`fixed inset-y-0 left-0 bg-[#0f172a] text-white w-64 z-50 transition-transform duration-300 lg:translate-x-0 ${isSidebarOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}`}>
+        <div className="p-6 border-b border-white/5 flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <h1 className="text-sm font-black text-pink-500 tracking-widest italic">{config.panelName}</h1>
+            {isOwner && <button onClick={() => updateGlobalSetting('panelName', config.panelName)} className="p-1.5 bg-indigo-500 rounded-lg text-white shadow-lg hover:rotate-12 transition"><Edit3 size={12}/></button>}
+          </div>
+          <button className="lg:hidden" onClick={() => setIsSidebarOpen(false)}><X size={20}/></button>
+        </div>
+        <nav className="p-4 space-y-2">
+           {[
+            {id: 'new_order', icon: Zap, label: 'Add Order'},
+            {id: 'orders', icon: List, label: 'My History'},
+            {id: 'add_funds', icon: Wallet, label: 'Add Balance'},
+            {id: 'admin_panel', icon: Clock, label: 'Approvals', adminOnly: true}
+          ].filter(t => !t.adminOnly || isOwner).map(tab => (
+            <button key={tab.id} onClick={() => {setActiveTab(tab.id); setIsSidebarOpen(false);}} className={`w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl text-[11px] font-black uppercase tracking-wider transition-all duration-200 ${activeTab === tab.id ? (tab.adminOnly ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-900/40' : 'bg-pink-600 text-white shadow-lg shadow-pink-900/40') : 'text-slate-400 hover:bg-white/5'}`}>
+              <tab.icon size={16}/> {tab.label}
+            </button>
+          ))}
+        </nav>
+        <div className="absolute bottom-6 w-full px-4">
+          <button onClick={() => isOwner ? setIsOwner(false) : setShowLoginModal(true)} className="w-full py-3.5 rounded-2xl bg-slate-900 border border-white/5 text-slate-400 text-[10px] font-black tracking-[0.2em] uppercase flex items-center justify-center gap-2 hover:bg-slate-800 hover:text-white transition-all shadow-xl">
+            {isOwner ? <><LogOut size={14}/> Exit Admin</> : <><Lock size={14}/> Admin Login</>}
+          </button>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <main className="flex-1 lg:ml-64 flex flex-col overflow-hidden">
+        <header className="bg-white border-b h-20 flex justify-between items-center px-6 sticky top-0 z-40">
+           <div className="flex items-center gap-3">
+             <button className="lg:hidden p-2 text-slate-400 hover:bg-slate-50 rounded-xl" onClick={() => setIsSidebarOpen(true)}><Menu size={20}/></button>
+             <h2 className="font-black text-slate-900 uppercase tracking-tighter text-lg">{activeTab.replace('_', ' ')}</h2>
+           </div>
+           <div className="bg-slate-50 px-5 py-2 rounded-2xl border border-slate-100 flex items-center gap-4 shadow-sm">
+             <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+             <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Balance:</p>
+             <p className="text-base font-black text-slate-900 italic">₹{balance.toFixed(2)}</p>
+           </div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-4 md:p-8 max-w-4xl mx-auto w-full pb-32">
+          {message.text && (
+            <div className={`fixed bottom-6 right-6 left-6 md:left-auto md:w-80 z-[60] p-5 rounded-3xl flex items-center gap-4 text-white shadow-[0_20px_50px_rgba(0,0,0,0.2)] animate-in slide-in-from-bottom-10 ${message.type === 'success' ? 'bg-indigo-600' : 'bg-rose-500'}`}>
+              <Sparkles size={20} className={message.type === 'success' ? 'animate-bounce' : ''}/> 
+              <p className="font-black text-xs uppercase tracking-wide">{message.text}</p>
+            </div>
+          )}
+
+          {/* ADMIN: APPROVALS */}
+          {activeTab === 'admin_panel' && isOwner && (
+            <div className="space-y-6">
+               <div className="space-y-4">
+                  <div className="flex justify-between items-center px-2">
+                    <h4 className="text-[11px] font-black uppercase text-slate-400 tracking-[0.2em]">Pending Requests</h4>
+                    <span className="bg-rose-100 text-rose-600 text-[10px] font-black px-2 py-0.5 rounded-lg">{paymentRequests.filter(r => r.status === 'Pending').length}</span>
+                  </div>
+                  {paymentRequests.filter(r => r.status === 'Pending').map(req => (
+                    <div key={req.id} className="bg-white p-7 rounded-[32px] border border-slate-100 shadow-sm flex flex-col md:flex-row justify-between items-center gap-6 hover:shadow-md transition-shadow">
+                        <div className="text-center md:text-left">
+                          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">{req.timeStr}</p>
+                          <p className="text-4xl font-black text-slate-900 italic">₹{req.amount}</p>
+                          <div className="mt-3 flex items-center gap-2">
+                            <span className="text-[10px] font-black bg-pink-50 text-pink-600 px-3 py-1.5 rounded-xl border border-pink-100 font-mono tracking-tighter">UTR: {req.utr}</span>
+                          </div>
+                        </div>
+                        <button onClick={() => approvePayment(req)} className="w-full md:w-auto px-12 py-5 bg-emerald-500 text-white rounded-[20px] font-black text-xs uppercase tracking-widest shadow-xl shadow-emerald-100 hover:bg-emerald-600 active:scale-95 transition-all">APPROVE NOW</button>
+                    </div>
+                  ))}
+                  {paymentRequests.filter(r => r.status === 'Pending').length === 0 && (
+                    <div className="bg-white/50 border-2 border-dashed border-slate-200 rounded-[32px] py-16 text-center opacity-40">
+                      <p className="font-black italic text-xs uppercase tracking-widest">No pending work! ✨</p>
+                    </div>
+                  )}
+               </div>
+            </div>
+          )}
+
+          {/* ADD FUNDS */}
+          {activeTab === 'add_funds' && (
+            <div className="grid md:grid-cols-2 gap-8">
+               <div className="bg-white p-10 rounded-[40px] border border-slate-100 shadow-sm flex flex-col items-center">
+                  <h3 className="text-[10px] font-black uppercase text-slate-400 mb-8 tracking-[0.2em] flex items-center gap-3">
+                    STEP 1: SCAN QR
+                    {isOwner && <button onClick={() => updateGlobalSetting('upiId', config.upiId)} className="p-2 bg-indigo-500 rounded-xl text-white shadow-lg"><Edit3 size={12}/></button>}
+                  </h3>
+                  <div className="bg-white p-5 border-[3px] border-slate-50 rounded-[40px] shadow-2xl mb-8 relative group">
+                    <img src={`https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=upi://pay?pa=${config.upiId}&pn=${config.panelName}&cu=INR`} className="w-48 h-48 rounded-xl" alt="QR" />
+                    <div className="absolute inset-0 bg-pink-500/5 opacity-0 group-hover:opacity-100 transition-opacity rounded-[40px]"></div>
+                  </div>
+                  <button onClick={() => {navigator.clipboard.writeText(config.upiId); showStatus('UPI Copied! ✨', 'success')}} className="px-6 py-2.5 bg-slate-50 rounded-2xl text-[10px] font-black text-slate-500 flex items-center gap-3 hover:bg-slate-100 transition-colors border border-slate-100">
+                    {config.upiId} <Copy size={14}/>
+                  </button>
+               </div>
+               <div className="bg-white p-10 rounded-[40px] border border-slate-100 shadow-sm flex flex-col justify-center">
+                  <h3 className="text-[10px] font-black uppercase text-slate-400 mb-8 tracking-[0.2em]">STEP 2: VERIFY UTR</h3>
+                  <form onSubmit={handlePaymentSubmit} className="space-y-5">
+                    <div className="space-y-2">
+                      <label className="text-[9px] font-black text-slate-400 uppercase ml-2 tracking-widest">Amount Paid</label>
+                      <input type="number" name="amount" placeholder="₹ 0.00" className="w-full p-5 bg-slate-50 rounded-[20px] font-black text-2xl outline-none focus:ring-4 ring-pink-50 transition-all border border-slate-100 shadow-inner" required />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] font-black text-slate-400 uppercase ml-2 tracking-widest">Transaction ID / UTR</label>
+                      <input type="text" name="utr" placeholder="12 DIGIT UTR" className="w-full p-5 bg-slate-50 rounded-[20px] font-mono font-black text-sm outline-none border border-slate-100 shadow-inner uppercase tracking-wider" required />
+                    </div>
+                    <button type="submit" className="w-full py-5 bg-[#0f172a] text-white rounded-[20px] font-black text-[10px] uppercase tracking-[0.3em] shadow-2xl hover:bg-slate-800 active:scale-95 transition-all mt-4">Submit Verification</
